@@ -3,11 +3,23 @@
 #pragma comment(lib, "ws2_32")
 #include <windows.h>
 #include <list>
+//※ 응용 프로그램 통신 프로토콜 정의가 들어있는 헤더파일
+#include "AppProtocol.h"
+
+typedef struct _PACKET
+{
+	unsigned int nHeader;
+	char buffer[8192]; // 8KB
+} PACKET;
 
 typedef struct _USSERSESSION
 {
 	SOCKET hSocket;
-	char buffer[8192];	//8KB
+	PACKET packet;
+
+	int chatCount;			//최근 1초 내 채팅 횟수
+	DWORD lastChatTick;		//마지막 채팅 시간(ms)
+	DWORD banEndTick;		//금지 해제 시간(ms) - GetTickCount() 기준 
 } USERSESSION;
 
 #define MAX_THREAD_CNT 4
@@ -18,17 +30,58 @@ SOCKET g_hSocket;				//서버의 리슨 소켓
 HANDLE g_hIocp;					//IOCP 핸들
 
 //연결된 모든 클라이언트한테 메세지를 전송한다.
-void sendMessageAll(char* pszMessage, int nSize)
+void sendMessageAll(PACKET packet, int nSize)
 {
 	std::list<SOCKET>::iterator it;
-
-	//중간에 다른 클라이언트의 채팅이 들어 오거나
-	//소켓이 끊겨서 리스트의 변형이 생기는 경우 리스트 충돌이 발생할 수 있으므로 
-	//임계영역을 설정한다. 
-	::EnterCriticalSection(&g_cs);	//임계영역 시작
+	::EnterCriticalSection(&g_cs);
 	for (it = g_listClient.begin(); it != g_listClient.end(); it++)
-		::send(*it, pszMessage, nSize, 0);
-	::LeaveCriticalSection(&g_cs);	//임계영역 끝
+	{
+		::send(*it, (char*)&packet, sizeof(packet), 0); // PACKET 구조체 전체 전송
+	}
+	::LeaveCriticalSection(&g_cs);
+}
+
+
+bool CheckChatBan(USERSESSION* pSession, int& nRemainSec)
+{
+	DWORD now = GetTickCount();
+
+	// 금지 상태 확인
+	if (now < pSession->banEndTick)
+	{
+		nRemainSec = (pSession->banEndTick - now) / 1000;
+		if (nRemainSec <= 0) nRemainSec = 1;
+		return true; // 금지 상태
+	}
+
+	// 금지 상태가 아니면 카운터 갱신
+	if (now - pSession->lastChatTick > 1000) {
+		// 1초 초과했으면 카운터 초기화
+		pSession->chatCount = 1;
+		pSession->lastChatTick = now;
+	}
+	else {
+		pSession->chatCount++;
+		// 1초 이내에 4번 이상의 채팅 발송시 채팅 금지 
+		if (pSession->chatCount > 4) {
+			// 금지 처리
+			pSession->banEndTick = now + 30000; // 30초
+			nRemainSec = 30;
+			return true;
+		}
+	}
+
+	return false; // 금지 아님
+}
+
+void SendChatBan(USERSESSION* pSession, int nRemainSec)
+{
+	PACKET pkt = { 0 };
+	pkt.nHeader = CMD_CHAT_STOP;
+	sprintf_s(pkt.buffer, sizeof(pkt.buffer), "%d", nRemainSec);
+
+
+	::send(pSession->hSocket, (char*)&pkt, sizeof(pkt), 0);
 }
 
 //클라이언트 및 리슨 소켓 닫기
@@ -78,16 +131,32 @@ DWORD WINAPI ThreadComplete(LPVOID pParam)
 			//2. 클라이언트가 보낸 데이터를 수신한 경우
 			else
 			{
-				printf("[채팅 로그]%s\n", pSession->buffer);
-				sendMessageAll(pSession->buffer, dwTransferredSize);
-				memset(pSession->buffer, 0, sizeof(pSession->buffer));
+				// 채팅 패킷인지 확인
+				if (pSession->packet.nHeader == CMD_CHAT)
+				{
+					int remainSec = 0;
+					if (CheckChatBan(pSession, remainSec))
+					{
+						// 금지 상태이므로 금지 메시지 전송
+						SendChatBan(pSession, remainSec);
+					}
+					else
+					{
+						printf("[채팅 로그] %s\n", pSession->packet.buffer);
+
+						pSession->packet.nHeader = CMD_CHAT;
+						sendMessageAll(pSession->packet, dwTransferredSize);
+					}
+				}
+
+				memset(pSession->packet.buffer, 0, sizeof(pSession->packet.buffer));
 
 				//다시 IOCP에 등록
 				DWORD dwReceiveSize = 0;
 				DWORD dwFlag = 0;
 				WSABUF wsaBuf = { 0 };
-				wsaBuf.buf = pSession->buffer;
-				wsaBuf.len = sizeof(pSession->buffer);
+				wsaBuf.buf = (char *)&pSession->packet;
+				wsaBuf.len = sizeof(PACKET);
 
 				::WSARecv(
 					pSession->hSocket,	//클라이언트 소켓 핸들
@@ -175,8 +244,8 @@ DWORD WINAPI ThreadAcceptLoop(LPVOID pParam)
 
 		dwReceiveSize = 0;
 		dwFlag = 0;
-		wsaBuf.buf = pNewUser->buffer;
-		wsaBuf.len = sizeof(pNewUser->buffer);
+		wsaBuf.buf = (char *)&pNewUser->packet;
+		wsaBuf.len = sizeof(PACKET);
 
 		//클라이언트가 보낸 정보를 비동기 수신한다.
 		nRecvResult = ::WSARecv(hClient, &wsaBuf, 1, &dwReceiveSize, &dwFlag, pWol, NULL);
